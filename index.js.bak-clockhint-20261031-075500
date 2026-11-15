@@ -1,0 +1,329 @@
+/**
+ * dsh-diary-memory —— 把"大肥鱼"的日记/记忆系统做成标准 DSH 插件
+ * ============================================================================
+ * 它替代原来那套散装件：
+ *   · src/mcp-diary.js（独立 MCP 进程）        → 插件内直接注册工具，少一个进程
+ *   · scripts/diary-merge.mjs（靠启动脚本调用） → 插件内定时器
+ *   · scripts/backup-memory.ps1（靠启动脚本）   → 插件内定时器
+ *
+ * 存储格式**完全不变**：还是那个单文件 jsonl，还是"传入 / 已合并"的无损合并。
+ * 所以装上插件后，历史记忆一个字都不用迁移。
+ *
+ * 配置有两层：① cordis.patch.yml 里的 config（默认值）；② <dataDir>/config.json（运行期覆盖，
+ * 由设置页写）。后者优先，所以设置页改完立刻生效，不需要重装插件。
+ * ============================================================================
+ */
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { loadHostDeps } from './lib/hostdeps.mjs'
+import { makeStore, stamp } from './lib/store.mjs'
+
+// 宿主依赖拿不到也不能让整条插件加载失败（模块导入期抛错 = 条目直接 failed）
+let hostDeps = { z: null, defineTool: null }
+try { hostDeps = await loadHostDeps() } catch (e) {
+  console.log(`[diary-memory] 取宿主依赖失败，用本地兜底：${e?.message ?? e}`)
+}
+const z = hostDeps.z
+const fallbackDefineTool = (options) => options
+const defineTool = hostDeps.defineTool || fallbackDefineTool
+
+const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
+
+export const name = 'diary-memory'
+export const inject = ['tools', 'webServer', 'agents']
+
+const DEFAULTS = {
+  enabled: true,
+  dataDir: 'D:\\小鲸鱼\\日记',
+  files: { main: '大肥鱼的日记.jsonl', inbox: '传入', archive: '已合并' },
+  diary: { perDay: 3, softLimit: 200, hardLimit: 300 },
+  today: { maxLength: 500 },
+  longTerm: {
+    categories: ['老大', '约定', '正在进行', '我们的梗', '其他'],
+    factMax: 50,
+    totalMax: 1500,
+    archiveOnOverflow: true,
+  },
+  merge: { onStartup: true, intervalMinutes: 5 },
+  backup: { enabled: true, target: 'F:\\大肥鱼的记忆备份', keep: 30, oncePerDay: true },
+  inject: { dailyBriefing: true, onlyQqSessions: true, keywordHits: false, hitTopK: 2, maxChars: 2000 },
+}
+
+export const Config = !z ? undefined : z.object({
+  enabled: z.boolean().default(true),
+  dataDir: z.string().default(DEFAULTS.dataDir),
+  diary: z.object({
+    perDay: z.natural().default(3),
+    softLimit: z.natural().default(200),
+    hardLimit: z.natural().default(300),
+  }).default(DEFAULTS.diary),
+  today: z.object({ maxLength: z.natural().default(500) }).default(DEFAULTS.today),
+  longTerm: z.object({
+    categories: z.array(z.string()).default(DEFAULTS.longTerm.categories),
+    factMax: z.natural().default(50),
+    totalMax: z.natural().default(1500),
+    archiveOnOverflow: z.boolean().default(true),
+  }).default(DEFAULTS.longTerm),
+  merge: z.object({
+    onStartup: z.boolean().default(true),
+    intervalMinutes: z.natural().default(5),
+  }).default(DEFAULTS.merge),
+  backup: z.object({
+    enabled: z.boolean().default(true),
+    target: z.string().default(DEFAULTS.backup.target),
+    keep: z.natural().default(30),
+    oncePerDay: z.boolean().default(true),
+  }).default(DEFAULTS.backup),
+  inject: z.object({
+    dailyBriefing: z.boolean().default(true),
+    onlyQqSessions: z.boolean().default(true),
+    keywordHits: z.boolean().default(false),
+    hitTopK: z.natural().default(2),
+    maxChars: z.natural().default(2000),
+  }).default(DEFAULTS.inject),
+})
+
+function deepMerge(base, patch) {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return patch === undefined ? base : patch
+  const out = Array.isArray(base) ? [...base] : { ...base }
+  for (const [k, v] of Object.entries(patch)) {
+    out[k] = (v && typeof v === 'object' && !Array.isArray(v) && base && typeof base[k] === 'object' && !Array.isArray(base[k]))
+      ? deepMerge(base[k], v)
+      : v
+  }
+  return out
+}
+
+export function apply(ctx, config) {
+  const log = (m) => console.log(`[diary-memory] ${m}`)
+
+  // ── 配置：默认值 ← 行配置 ← 运行期 config.json ──────────────
+  let cfg = deepMerge(DEFAULTS, config || {})
+  const cfgFile = join(cfg.dataDir, 'config.json')
+
+  function loadRuntimeConfig() {
+    try {
+      if (existsSync(cfgFile)) cfg = deepMerge(cfg, JSON.parse(readFileSync(cfgFile, 'utf8')))
+    } catch (e) { log(`读 config.json 失败：${e?.message ?? e}`) }
+  }
+  function saveRuntimeConfig(patch) {
+    const next = deepMerge(cfg, patch || {})
+    mkdirSync(cfg.dataDir, { recursive: true })
+    writeFileSync(cfgFile, JSON.stringify(next, null, 2), 'utf8')
+    cfg = next
+    return cfg
+  }
+
+  loadRuntimeConfig()
+  if (cfg.enabled === false) { log('插件已关闭（config.enabled=false）'); return }
+
+  let store = makeStore(cfg)
+  const rebuild = () => { store = makeStore(cfg) }
+  store.ensureLayout()
+  log(`已挂载，数据目录 ${store.main}`)
+
+  const textOutput = {
+    schema: { type: 'object', properties: {}, additionalProperties: true },
+    render: (_args, value) => [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
+  }
+  const tool = (spec) => ctx.tools.register(defineTool({ ...spec, output: textOutput }))
+
+  const oneLine = (v, max) => String(v ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max)
+  const normTime = (v) => {
+    if (v === undefined || String(v).trim() === '') return stamp()
+    const t = String(v).trim()
+    return /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(t) ? t : null
+  }
+
+  // ── 工具：写 ────────────────────────────────────────────────
+  tool({
+    name: 'diary_write',
+    description: '写一条记忆。类型"日记"=你自己想写的时候写（有时间/条数/字数限制）；'
+      + '类型"今天"=他下班/睡前你给这一天留的备忘。内容要具体，不要写总结和周报。',
+    parameters: {
+      类型: { type: 'string', description: '日记 或 今天（默认 日记）' },
+      内容: { type: 'string', description: '这一条的内容，具体、短；必填' },
+      心情: { type: 'string', description: '几个字：还行 / 烦 / 困 / 有点开心' },
+      时间: { type: 'string', description: '格式 2026-10-11 03:20；不填用当前时间' },
+    },
+    async execute(args) {
+      const type = String(args?.类型 || '日记').trim()
+      if (!['日记', '今天'].includes(type)) return { ok: false, error: `类型只能是「日记」或「今天」` }
+      const time = normTime(args?.时间)
+      if (!time) return { ok: false, error: '时间格式要像 2026-10-11 03:20' }
+
+      const L = store.limits
+      const hard = type === '日记' ? L.diaryHard : L.todayMax
+      const soft = type === '日记' ? L.diarySoft : Math.floor(L.todayMax * 0.8)
+      const body = oneLine(args?.内容, hard + 1)
+      if (!body) return { ok: false, error: '内容为空' }
+      if (body.length > hard) return { ok: false, error: `这条 ${body.length} 字，超过 ${hard} 字上限` }
+
+      const day = time.slice(0, 10)
+      if (type === '日记' && store.countOn(day, '日记') >= L.diaryPerDay) {
+        return { ok: false, error: `${day} 已经写了 ${L.diaryPerDay} 条，今天不写了` }
+      }
+      const rec = { 类型: type, 时间: time, 内容: body }
+      const mood = oneLine(args?.心情, 12)
+      if (mood) rec['心情'] = mood
+      store.appendRecord(rec)
+      // 注意：不能把 undefined 放进返回值 —— DSH 要求工具输出是 lossless JSON，
+      // 一个 hint: undefined 就会让整个调用报 "returned invalid output: value is not lossless JSON"，
+      // 她那边看到的是失败、会重写，而文件其实已经写进去了（2026-10-22 踩过）。
+      const out = { ok: true, record: rec }
+      if (body.length > soft) out.hint = `有点长（${body.length} 字）`
+      return out
+    },
+  })
+
+  // ── 工具：长期记忆（整体替换） ──────────────────────────────
+  tool({
+    name: 'diary_remember',
+    description: '更新长期记忆的某一类。⚠️ **整体替换**：你传什么这一类就变成什么，没传的旧条目会消失。'
+      + '每次都要把这一类现有的全部条目带上。',
+    parameters: {
+      分类: { type: 'string', description: '分类名（见工具说明）；必填' },
+      条目: { type: 'string', description: '这一类的**全部**条目，用「；」或换行分隔；必填（不是只传新增的）' },
+    },
+    async execute(args) {
+      try {
+        const raw = args?.条目
+        const items = Array.isArray(raw)
+          ? raw
+          : String(raw || '').split(/[；;\n]+/).map((s) => s.trim()).filter(Boolean)
+        const r = store.replaceCategory(args?.分类, items)
+        return { ok: true, ...r, totalChars: store.longTermChars(), limit: store.limits.totalMax }
+      } catch (e) { return { ok: false, error: e?.message ?? String(e) } }
+    },
+  })
+
+  // ── 工具：翻旧账 ────────────────────────────────────────────
+  tool({
+    name: 'diary_recall',
+    description: '按关键词在全部记忆里翻（日记、今天、长期记忆、归档都能翻到）。想不起细节就翻，不要凭印象编。',
+    parameters: {
+      关键词: { type: 'string', description: '要翻的词；必填' },
+      条数: { type: 'number', description: '最多返回几条（默认 20）' },
+    },
+    async execute(args) {
+      const hits = store.search(args?.关键词, Number(args?.条数) || 20)
+      return { ok: true, count: hits.length, hits }
+    },
+  })
+
+  // ── 工具：记忆简报 ──────────────────────────────────────────
+  tool({
+    name: 'diary_briefing',
+    description: '取一份记忆简报（你记住的大事 + 最近几条日记 + 上次的"今天"）。每天首轮会自动注入，一般不用手动调。',
+    parameters: {},
+    async execute() {
+      return { ok: true, text: store.buildBriefing() || '（还没有任何记忆）' }
+    },
+  })
+
+  // ── 工具：状态 ──────────────────────────────────────────────
+  tool({
+    name: 'diary_status',
+    description: '看记忆库的现状：条数、长期记忆字数、文件路径、各开关。排查问题时用。',
+    parameters: {},
+    async execute() {
+      return {
+        ok: true,
+        stats: store.stats(),
+        limits: store.limits,
+        switches: {
+          合并间隔分钟: cfg.merge?.intervalMinutes,
+          启动时合并: cfg.merge?.onStartup,
+          备份: cfg.backup?.enabled,
+          首轮注入: cfg.inject?.dailyBriefing,
+          关键词命中: cfg.inject?.keywordHits,
+        },
+      }
+    },
+  })
+
+  // ── 原生注入：每天首轮把记忆简报塞进提示词 ─────────────────
+  // 火忘式启动：拿不到 agents 服务或钩子失败都只记日志，绝不拖垮插件。
+  if (cfg.inject?.dailyBriefing) {
+    import('./lib/inject.mjs')
+      .then((m) => m.setupInjection(ctx, cfg, store, log))
+      .catch((e) => log(`注入模块加载失败：${e?.message ?? e}`))
+  }
+  // ── 定时：合并「传入」 ──────────────────────────────────────
+  if (cfg.merge?.onStartup) {
+    try { const r = store.mergeIncoming(); if (r.files) log(`启动合并：${r.files} 个文件，新增 ${r.added} 条`) }
+    catch (e) { log(`启动合并失败：${e?.message ?? e}`) }
+  }
+
+  const mergeMinutes = Math.max(1, Number(cfg.merge?.intervalMinutes) || 5)
+  const mergeTimer = setInterval(() => {
+    try { const r = store.mergeIncoming(); if (r.files) log(`定时合并：新增 ${r.added} 条`) }
+    catch (e) { log(`定时合并失败：${e?.message ?? e}`) }
+  }, mergeMinutes * 60 * 1000)
+  ctx.effect(() => () => clearInterval(mergeTimer), 'diary-memory: 合并定时器')
+
+  // ── 定时：每天备份一次 ─────────────────────────────────────
+  let backupTimer = null
+  if (cfg.backup?.enabled) {
+    const doBackup = async () => {
+      try {
+        const { runBackup } = await import('./lib/backup.mjs')
+        const r = await runBackup(cfg, store)
+        if (r?.skipped) return
+        log(`备份完成：${r?.dest ?? ''}（${
+          r?.folders?.length ?? 0
+        } 项）`)
+      } catch (e) { log(`备份失败：${e?.message ?? e}`) }
+    }
+    doBackup()
+    backupTimer = setInterval(doBackup, 6 * 60 * 60 * 1000)
+    ctx.effect(() => () => clearInterval(backupTimer), 'diary-memory: 备份定时器')
+  }
+
+  // ── 设置页用的 HTTP 接口 ───────────────────────────────────
+  const sendJson = (res, code, body) => {
+    try {
+      res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify(body))
+    } catch {}
+  }
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'prefix',
+    path: '/api/diary-memory',
+    handler: async (req, res) => {
+      const url = new URL(req.url, 'http://127.0.0.1')
+      const path = url.pathname
+      try {
+        if (req.method === 'GET' && path === '/api/diary-memory/config') {
+          return sendJson(res, 200, { ok: true, config: cfg, configFile: cfgFile, defaults: DEFAULTS })
+        }
+        if (req.method === 'POST' && path === '/api/diary-memory/config') {
+          const chunks = []
+          for await (const c of req) chunks.push(c)
+          const patch = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+          saveRuntimeConfig(patch)
+          rebuild()
+          store.ensureLayout()
+          return sendJson(res, 200, { ok: true, config: cfg })
+        }
+        if (req.method === 'GET' && path === '/api/diary-memory/stats') {
+          return sendJson(res, 200, { ok: true, stats: store.stats(), limits: store.limits })
+        }
+        if (req.method === 'POST' && path === '/api/diary-memory/merge') {
+          return sendJson(res, 200, { ok: true, ...store.mergeIncoming() })
+        }
+        if (req.method === 'POST' && path === '/api/diary-memory/backup') {
+          const { runBackup } = await import('./lib/backup.mjs')
+          return sendJson(res, 200, { ok: true, ...(await runBackup(cfg, store)) })
+        }
+        return sendJson(res, 404, { ok: false, error: 'not found' })
+      } catch (e) {
+        return sendJson(res, 500, { ok: false, error: e?.message ?? String(e) })
+      }
+    },
+  }), 'diary-memory: /api/diary-memory 路由')
+
+  log(`开关：合并每 ${mergeMinutes} 分钟 / 备份 ${cfg.backup?.enabled ? '开' : '关'} / 首轮注入 ${cfg.inject?.dailyBriefing ? '开' : '关'}`)
+}

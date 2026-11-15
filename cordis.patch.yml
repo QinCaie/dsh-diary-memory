@@ -1,0 +1,14 @@
+# ============================================================================
+# dsh-diary-memory —— bundle patch
+# ============================================================================
+# 注意：这里**故意不写 config**。
+# 原因：DSH 的配置行要靠 schemastery 的 Schema 校验，而宿主包在 app.asar 里，
+# 插件自己的 node_modules 里拿不到 @deepseek-ai/schemastery ⇒ Config 导出是
+# undefined ⇒ 带 config 的行在激活阶段直接失败（实测 fiberPhase=failed）。
+# 所以默认值放在 index.js 的 DEFAULTS 里，运行期配置放 <dataDir>/config.json，
+# 设置页通过 /api/diary-memory/config 读写。效果一样，还少一层依赖。
+# ============================================================================
+
+- insert:
+    - id: diary-memory
+      name: dsh-diary-memory
